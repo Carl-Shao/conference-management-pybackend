@@ -4,12 +4,13 @@ import os
 import time
 import threading
 import json
-import requests
 from funasr import AutoModel
 from config import Config
 
 # ==================== 全局变量 ====================
 asr_results = {}  # 存储ASR识别结果，key为meeting_id
+_mq_channel = None      # 保存消费者channel引用，便于停止
+_mq_connection = None   # 保存消费者connection引用，便于停止
 
 # =================== 本地ASR模型 ===================
 asr_model = AutoModel(
@@ -25,6 +26,92 @@ def get_room_directory(room_id):
     if not os.path.exists(dir_path):
         os.makedirs(dir_path)
     return dir_path
+
+def get_mq_connection():
+    "create connection to RabbitMQ"
+    credentials = pika.PlainCredentials(Config.RABBITMQ_USER, Config.RABBITMQ_PASS)
+    return pika.BlockingConnection(
+        pika.ConnectionParameters(
+            host=Config.RABBITMQ_HOST,
+            port=Config.RABBITMQ_PORT,
+            credentials=credentials
+        )
+    )
+
+def start_mq_consumer():
+    """
+    start RabbitMQ consumer, listen audio ready queue
+    """
+    global _mq_channel, _mq_connection
+    
+    def consume():
+        global _mq_channel, _mq_connection
+        try:
+            _mq_connection = get_mq_connection()
+            _mq_channel = _mq_connection.channel()
+
+            _mq_channel.exchange_declare(
+                exchange='audio_events',
+                exchange_type='direct',
+                durable=True
+            )
+            _mq_channel.queue_declare(queue='audio_ready', durable=True)
+            _mq_channel.queue_bind(
+                queue='audio_ready',
+                exchange='audio_events',
+                routing_key='audio.ready'
+            )
+
+            # prefetch=1: 保证同一时刻只处理一条消息
+            # asr_model是单个模型实例，多线程并发调用generate容易有问题
+            # 如需提速应该是"多开消费者进程"做水平扩展，而不是同进程内并发
+            _mq_channel.basic_qos(prefetch_count=1)
+
+            def callback(ch, method, properties, body):
+                try:
+                    data = json.load(body)
+                    meeting_id = data['meeting_id']
+                    audio_path = data['audio_path']
+                    print(f"📩 收到音频就绪消息：会议{meeting_id}, 文件{audio_path}")
+
+                    handle_asr_task(meeting_id, audio_path)
+
+                    ch.basic_ack(delivery_tag=method.delivery_tag)
+
+                except Exception as e:
+                    print(f"❌ ASR任务处理失败：{e}")
+                    # 失败不重投，避免坏文件反复消费；建议给队列配死信队列(DLX)方便排查
+                    ch.basic_nack(delivery_tag=method.delivery_tag, requeue=False)
+
+            _mq_channel.basic_consume(
+                queue='audio_ready', 
+                on_message_callback=callback
+            )
+            print("🔍 开始监听RabbitMQ音频就绪队列")
+            _mq_channel.start_consuming()
+
+        except Exception as e:
+            print(f"❌ MQ消费者异常退出：{e}")
+
+    consumer_thread = threading.Thread(target=consume, daemon=True)
+    consumer_thread.start()
+    return consumer_thread
+
+def stop_mq_consumer():
+    """stop consumer"""
+    global _mq_channel, _mq_connection
+    try:
+        if _mq_channel is not None:
+            _mq_channel.stop_consuming
+        if _mq_connection is not None:
+            _mq_connection.close()
+        print("🔍 已停止监听RabbitMQ音频就绪队列")
+
+    except Exception as e:
+        print(f"⚠️ 停止MQ消费者时出错：{e}")
+    finally:
+        _mq_channel = None
+        _mq_connection = None
 
 def process_asr_with_local(audio_file_path):
     try:
