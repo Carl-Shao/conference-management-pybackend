@@ -29,3 +29,10 @@ class Config:
     # 音频处理配置
     CHUNK_DURATION = 10                      # 音频分片时长（秒）
     BASE_AUDIO_DIR = r"D:\project_all\rstp1\storage"   # 音频存储目录
+
+    # RabbitMQ 配置 
+    RABBITMQ_HOST = 'localhost'
+    RABBITMQ_PORT = 5672
+    RABBITMQ_USER = 'shaoqi'
+    RABBITMQ_PASS = 'Shaoqi2006'
+    RABBITMQ_QUEUE = 'audio_ready_queue'

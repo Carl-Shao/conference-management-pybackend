@@ -4,7 +4,7 @@ import os
 from config import Config
 
 # ==================== 配置 ====================
-OLLAMA_MODEL = "deepseek-r1:7b"
+OLLAMA_MODEL = "qwen2.5:7b"
 OLLAMA_API_URL = "http://localhost:11434/api/chat"
 MINUTES_FILE = "meeting_minutes.md"
 

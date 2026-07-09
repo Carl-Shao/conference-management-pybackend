@@ -1,0 +1,13 @@
+name: conference-management-pybackend
+
+services:
+  rabbitmq:
+    image: rabbitmq:3-management
+    container_name: rabbitmq-service
+    restart: always
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    environment:
+      - RABBITMQ_DEFAULT_USER=shaoqi
+      - RABBITMQ_DEFAULT_PASS=Shaoqi2006
