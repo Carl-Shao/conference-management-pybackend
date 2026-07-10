@@ -19,7 +19,7 @@ def get_room_directory(room_id):
 def is_room_recording(room_id):
     """check whether room is recording"""
     process = video_recording_processes.get(room_id)
-    return process is not None and process.pull() is None
+    return process is not None and process.poll() is None
 
 def start_video_recording(room_id, rtsp_url):
     """

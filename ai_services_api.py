@@ -18,10 +18,10 @@ ai_api_service.py
 
 from flask import Flask, request, jsonify
 import traceback
-from services.audio_service import audio_service
-from services.video_service import video_service
-from services.asr_service import asr_service
-from services.minutes_service import minutes_service
+import services.audio_service
+import services.video_service
+import services.asr_service
+import services.minutes_service
 from config import Config
 
 app = Flask(__name__)
@@ -52,8 +52,8 @@ def start_meeting():
         return fail("roomId 和 rtspUrl 不能为空", code=400)
  
     try:
-        audio_ok, audio_path = audio_service.start_audio_recording(room_id, rtsp_url)
-        video_ok, video_path = video_service.start_video_recording(room_id, rtsp_url)
+        audio_ok, audio_path = services.audio_service.start_audio_recording(room_id, rtsp_url)
+        video_ok, video_path = services.video_service.start_video_recording(room_id, rtsp_url)
  
         if not audio_ok or not video_ok:
             return fail(
@@ -90,11 +90,11 @@ def stop_meeting():
  
     try:
         # 停止前先拿到路径（此时文件仍在写入中，但路径是确定的）
-        audio_path = audio_service.get_audio_recording_path(room_id)
-        video_path = video_service.get_video_recording_path(room_id)
+        audio_path = services.audio_service.get_audio_recording_path(room_id)
+        video_path = services.video_service.get_video_recording_path(room_id)
  
-        audio_stopped = audio_service.stop_audio_recording(room_id, audio_path)
-        video_stopped = video_service.stop_video_recording(room_id)
+        audio_stopped = services.audio_service.stop_audio_recording(room_id, audio_path)
+        video_stopped = services.video_service.stop_video_recording(room_id)
  
         return ok({
             "roomId": room_id,
@@ -117,7 +117,7 @@ def get_transcript(room_id):
     获取会议转录文本（ASR是异步的，可能还没处理完，建议轮询此接口）
     """
     try:
-        transcript = asr_service.get_transcript(room_id)
+        transcript = services.asr_service.get_transcript(room_id)
         return ok({"roomId": room_id, "transcript": transcript})
     except Exception as e:
         traceback.print_exc()
@@ -134,7 +134,7 @@ def generate_minutes(room_id):
     状态变为 completed 后再调 GET /api/meeting/{room_id}/minutes 拿最终内容
     """
     try:
-        submitted = minutes_service.request_minutes_generation(room_id)
+        submitted = services.minutes_service.request_minutes_generation(room_id)
         if not submitted:
             return fail("提交纪要生成任务失败，请检查转录文件是否存在", code=400)
         return ok({"roomId": room_id, "status": "pending"}, msg="纪要生成任务已提交，正在后台处理")
@@ -149,7 +149,7 @@ def get_minutes_status(room_id):
     查询会议纪要生成状态：pending / processing / completed / failed / not_found
     """
     try:
-        status = minutes_service.get_minutes_status(room_id)
+        status = services.minutes_service.get_minutes_status(room_id)
         return ok({"roomId": room_id, **status})
     except Exception as e:
         traceback.print_exc()
@@ -164,7 +164,7 @@ def get_minutes(room_id):
     获取已生成的会议纪要（如果还没生成过，返回空字符串）
     """
     try:
-        minutes = minutes_service.get_meeting_minutes(room_id)
+        minutes = services.minutes_service.get_meeting_minutes(room_id)
         return ok({"roomId": room_id, "minutes": minutes})
     except Exception as e:
         traceback.print_exc()
@@ -175,16 +175,16 @@ def get_minutes(room_id):
  
 @app.route("/api/health", methods=["GET"])
 def health():
-    alive_asr_workers = [p.name for p in asr_service._worker_processes if p.is_alive()]
-    alive_minutes_workers = [t.name for t in minutes_service._worker_threads if t.is_alive()]
+    alive_asr_workers = [p.name for p in services.asr_service._worker_processes if p.is_alive()]
+    alive_minutes_workers = [t.name for t in services.minutes_service._worker_threads if t.is_alive()]
     return ok({
         "asrWorkerCount": len(alive_asr_workers),
         "asrWorkers": alive_asr_workers,
         "minutesWorkerCount": len(alive_minutes_workers),
         "minutesWorkers": alive_minutes_workers,
         "recordingRooms": {
-            "audio": list(audio_service.audio_recording_processes.keys()),
-            "video": list(video_service.video_recording_processes.keys()),
+            "audio": list(services.audio_service.audio_recording_processes.keys()),
+            "video": list(services.video_service.video_recording_processes.keys()),
         },
     }, msg="service is up")
  
@@ -197,8 +197,8 @@ def create_app():
     - 启动ASR服务的多进程worker池（每个worker独立进程、独立模型实例）
     - 启动会议纪要生成的多线程worker池（共用Ollama服务端，线程级并发即可）
     """
-    asr_service.start_asr_service()
-    minutes_service.start_minutes_service()
+    services.asr_service.start_asr_service()
+    services.minutes_service.start_minutes_service()
     return app
  
  
@@ -207,7 +207,7 @@ if __name__ == "__main__":
     # 离线内网环境下，建议生产部署时换成 waitress 或 gunicorn，而不是Flask自带的开发服务器
     application.run(
         host=getattr(Config, "API_HOST", "0.0.0.0"),
-        port=getattr(Config, "API_PORT", 5000),
+        port=getattr(Config, "API_PORT", 5001),
         threaded=True,
     )
  

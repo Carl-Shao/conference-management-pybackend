@@ -23,7 +23,7 @@ def get_mq_connection():
     return pika.BlockingConnection(
         pika.ConnectionParameters(
             host=Config.RABBITMQ_HOST,
-            prot=Config.RABBITMQ_PORT,
+            port=Config.RABBITMQ_PORT,
             credentials=credentials
         )
     )
@@ -567,31 +567,36 @@ def generate_minutes_from_transcript_file(room_id):
 
 def request_minutes_generation(room_id):
     """
-    提交一个"生成会议纪要"的异步任务到MQ，立即返回，不等待Ollama处理完成
+    提交一个"生成会议纪要"的异步任务到MQ，立即返回，不等待Ollama处理完成。
+    真正的生成动作由下面的worker线程池并发执行，多个会议室的任务可以同时被不同worker领走处理。
     :param room_id: 会议ID
     :return: 是否提交成功
     """
-    room_dir = os.path.join(Config.BASE_AUDIO_DIR,room_id)
+    room_dir = os.path.join(Config.BASE_AUDIO_DIR, room_id)
     if not os.path.exists(room_dir):
+        os.makedirs(room_dir)
+ 
+    transcript_path = os.path.join(room_dir, "transcript.txt")
+    if not os.path.exists(transcript_path):
         print(f"❌ 会议{room_id}转录文件不存在，无法提交纪要生成任务")
         return False
-    
+ 
     try:
         connection = get_mq_connection()
         channel = connection.channel()
-        channel.exchange_declare(exchange="minutes_events", exchange_type="direct", durable=True)
-        channel.queue_declare(queue="minutes_generate", durable=True)
-        channel.queue_bind(queue="minutes_generate", exchange="minutes_events", routing_key="minutes.generate")
-
-        meassage = json.dumps({'room_id':room_id, 'timestamp':time.time()})
+        channel.exchange_declare(exchange='minutes_events', exchange_type='direct', durable=True)
+        channel.queue_declare(queue='minutes_generate', durable=True)
+        channel.queue_bind(queue='minutes_generate', exchange='minutes_events', routing_key='minutes.generate')
+ 
+        message = json.dumps({'room_id': room_id, 'timestamp': time.time()})
         channel.basic_publish(
-            exchange="minutes_events",
-            routing_key="minutes.generate",
-            body=meassage,
+            exchange='minutes_events',
+            routing_key='minutes.generate',
+            body=message,
             properties=pika.BasicProperties(delivery_mode=2)
         )
         connection.close()
-
+ 
         _write_status(room_dir, "pending")
         print(f"📤 已提交会议纪要生成任务：会议{room_id}")
         return True
@@ -601,55 +606,56 @@ def request_minutes_generation(room_id):
 
 
 # ==================== Worker线程（并发处理多个会议室的纪要生成）====================
-
+ 
 def _minutes_worker_entrypoint(worker_index):
     """
-    单个worker线程的完整生命周期：独立连接RabbitMQ，prefetch=1串行消费"自己领到的"任务。
-
-    Ollama运行自己的服务进程，不加载进Python进程的内存，
-    只发HTTP请求、等待响应（I/O等待），
-    多个线程可以真正并发发请求、并发等待响应，不需要额外的进程级隔离。
-
-    并发上限取决于Ollama自身的并发配置（OLLAMA_NUM_PARALLEL）
+    单个worker线程的完整生命周期：独立连接RabbitMQ，prefetch=1串行消费任务。
+ 
+    Ollama运行在自己的服务进程里，不是加载进Python进程的内存，
+    只发HTTP请求、等待响应
+    多个线程可以真正并发地发请求、并发地等待响应，不需要额外的进程级隔离。
+ 
+    并发上限取决于Ollama服务端自身的并发配置（OLLAMA_NUM_PARALLEL环境变量）。
     """
     connection = get_mq_connection()
     channel = connection.channel()
-
-    channel.exchange_declare(exchange="minutes_events", exchange_type="direct", durable=True)
-    channel.queue_declare(queue="minutes_generate", durable=True)
-    channel.queue_bind(queue="minutes_generate", exchange="minutes_events", routing_key="minutes.generate")
-
+ 
+    channel.exchange_declare(exchange='minutes_events', exchange_type='direct', durable=True)
+    channel.queue_declare(queue='minutes_generate', durable=True)
+    channel.queue_bind(queue='minutes_generate', exchange='minutes_events', routing_key='minutes.generate')
+ 
     channel.basic_qos(prefetch_count=1)
-
-    def callback(ch, method, properties,body):
+ 
+    def callback(ch, method, properties, body):
         try:
             data = json.loads(body)
             room_id = data['room_id']
             room_dir = os.path.join(Config.BASE_AUDIO_DIR, room_id)
-
+ 
             print(f"📩 [minutes-worker-{worker_index}] 收到纪要生成任务：会议{room_id}")
             _write_status(room_dir, "processing")
-
+ 
             minutes = generate_minutes_from_transcript_file(room_id)
-
+ 
             if minutes:
                 _write_status(room_dir, "completed")
                 print(f"✅ [minutes-worker-{worker_index}] 会议{room_id}纪要生成完成")
             else:
                 _write_status(room_dir, "failed")
                 print(f"❌ [minutes-worker-{worker_index}] 会议{room_id}纪要生成失败")
-
+ 
             ch.basic_ack(delivery_tag=method.delivery_tag)
         except Exception as e:
             print(f"❌ [minutes-worker-{worker_index}] 处理纪要生成任务异常：{e}")
             ch.basic_nack(delivery_tag=method.delivery_tag, requeue=False)
-
+ 
     channel.basic_consume(queue='minutes_generate', on_message_callback=callback)
-    print(f"🔍 [minutes-worker-{worker_index}] 已就绪，开始监听纪要生成队列")    
-
-    #定期检查_stop_flag
+    print(f"🔍 [minutes-worker-{worker_index}] 已就绪，开始监听纪要生成队列")
+ 
+    # 用process_data_events轮询代替start_consuming()的死循环，
+    # 这样可以定期检查_stop_flag，支持优雅停止
     try:
-        while _stop_flag.is_set():
+        while not _stop_flag.is_set():
             connection.process_data_events(time_limit=1)
     finally:
         try:
@@ -657,8 +663,8 @@ def _minutes_worker_entrypoint(worker_index):
             connection.close()
         except Exception:
             pass
-
-    
+ 
+ 
 def start_minutes_service(worker_count=None):
     """
     启动会议纪要生成服务：拉起N个worker线程并发消费MQ任务
@@ -666,10 +672,10 @@ def start_minutes_service(worker_count=None):
     """
     global _worker_threads
     _stop_flag.clear()
-
+ 
     worker_count = worker_count or getattr(Config, "MINUTES_WORKER_COUNT", 4)
     print(f"🚀 启动会议纪要生成服务，worker数量：{worker_count}...")
-
+ 
     for i in range(worker_count):
         t = threading.Thread(
             target=_minutes_worker_entrypoint,
@@ -680,10 +686,10 @@ def start_minutes_service(worker_count=None):
         t.start()
         _worker_threads.append(t)
         print(f"✅ minutes worker-{i} 已启动")
-
+ 
     return _worker_threads
-
-
+ 
+ 
 def stop_minutes_service():
     """停止会议纪要生成服务的所有worker线程"""
     global _worker_threads

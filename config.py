@@ -1,7 +1,7 @@
 class Config:
     SECRET_KEY = 'your-secret-key-here'
     DEBUG = True
-    PORT = 5000
+    PORT = 5001
     
     # 数据库配置
     DB_HOST = 'localhost'
@@ -23,13 +23,13 @@ class Config:
     
     # 音频处理配置
     CHUNK_DURATION = 10                      # 音频分片时长（秒）
-    BASE_AUDIO_DIR = r"D:\project_all\rstp1\storage"   # 音频存储目录
+    BASE_AUDIO_DIR = r"/project_audio"   # 音频存储目录
 
     # 并发处理转录配置
-    ASR_WORKER_COUNT = 10 # 并发处理10个会议室的转录
+    ASR_WORKER_COUNT = 1 # 并发处理10个会议室的转录
 
     # Ollama并发配置
-    MINUTES_WORKER_COUNT = 4
+    MINUTES_WORKER_COUNT = 1
 
     # RabbitMQ 配置 
     RABBITMQ_HOST = 'localhost'

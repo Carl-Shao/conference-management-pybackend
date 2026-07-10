@@ -10,9 +10,6 @@ from config import Config
 # ==================== 全局变量 ====================
 asr_results = {}    
 _worker_processes = []
-_mq_channel = None      # 保存消费者channel引用，便于停止
-_mq_connection = None   # 保存消费者connection引用，便于停止
-
 
 # ==================== 每个worker进程独立加载一份 ====================
 # 模型改为懒加载，每个worker进程各自维护自己的实例，互不共享、互不影响。
