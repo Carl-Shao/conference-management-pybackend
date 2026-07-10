@@ -4,8 +4,7 @@ import time
 from config import Config
 
 # ==================== 全局变量 ====================
-video_recording_process = None  # FFmpeg视频录制进程
-is_video_recording = False      # 是否正在录制视频
+video_recording_processes = {}  # FFmpeg视频录制进程
 
 def get_room_directory(room_id):
     """获取指定会议室的存储目录（确保目录存在）"""
@@ -16,6 +15,12 @@ def get_room_directory(room_id):
         os.makedirs(room_dir)
     return room_dir
 
+
+def is_room_recording(room_id):
+    """check whether room is recording"""
+    process = video_recording_processes.get(room_id)
+    return process is not None and process.pull() is None
+
 def start_video_recording(room_id, rtsp_url):
     """
     开始录制RTSP流到MP4文件，包含视频和音频
@@ -23,7 +28,9 @@ def start_video_recording(room_id, rtsp_url):
     :param rtsp_url: RTSP流地址
     :return: (录制是否成功启动, 录制文件路径)
     """
-    global video_recording_process, is_video_recording
+    if is_room_recording(room_id):
+        print(f"⚠️ 会议{room_id}视频录制已在进行中，忽略本次启动请求")
+        return False, ""
 
     # 获取录制文件存储路径
     room_dir = get_room_directory(room_id)
@@ -46,46 +53,45 @@ def start_video_recording(room_id, rtsp_url):
 
     try:
         # 启动FFmpeg录制进程
-        video_recording_process = subprocess.Popen(
+        process = subprocess.Popen(
             ffmpeg_cmd,
             stdout=subprocess.DEVNULL,     # 屏蔽FFmpeg输出
             stderr=subprocess.PIPE,        # 捕获错误信息
         )
-        is_video_recording = True
-        print(f"📹 MP4视频录制已开始：{recording_path}")
+        video_recording_processes[room_id] = process
+        print(f"📹 会议{room_id} MP4视频录制已开始：{recording_path}")
         return True, recording_path
     except Exception as e:
-        print(f"❌ 启动MP4视频录制失败：{e}")
+        print(f"❌ 会议{room_id} 启动MP4视频录制失败：{e}")
         return False, ""
 
-def stop_video_recording():
+def stop_video_recording(room_id):
     """
     停止视频录制（安全终止FFmpeg进程）
     :return: 停止是否成功
     """
-    global video_recording_process, is_video_recording
+    process = video_recording_processes.get(room_id)
 
-    if not is_video_recording or not video_recording_process:
-        print("❌ 视频录制未启动，无需停止")
+    if not process:
+        print(f"❌ 会议{room_id} 视频录制未启动，无需停止")
         return False
 
     try:
         # 终止FFmpeg进程（安全停止录制）
-        video_recording_process.terminate()
+        process.terminate()
         # 等待进程退出，确保文件写入完成
-        stderr_output, _ = video_recording_process.communicate(timeout=10)
-        print(f"📹 FFmpeg stderr: {stderr_output.decode() if stderr_output else 'No stderr'}")
+        stderr_output, _ = process.communicate(timeout=10)
+        print(f"📹 会议{room_id} FFmpeg stderr: {stderr_output.decode() if stderr_output else 'No stderr'}")
     except subprocess.TimeoutExpired:
         # 超时则强制杀死进程
-        video_recording_process.kill()
-        print("⚠️ 录制进程超时，已强制终止")
+        process.kill()
+        print(f"⚠️会议{room_id} 录制进程超时，已强制终止")
     except Exception as e:
-        print(f"⚠️ 停止录制时出错：{e}")
+        print(f"⚠️会议{room_id} 停止录制时出错：{e}")
 
     # 重置状态
-    video_recording_process = None
-    is_video_recording = False
-    print("📹 MP4录制已停止")
+    del video_recording_processes[room_id]
+    print(f"📹会议{room_id} MP4录制已停止")
     return True
 
 def get_video_recording_path(room_id):

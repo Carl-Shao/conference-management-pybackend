@@ -6,14 +6,17 @@ import json
 from config import Config
 
 # ==================== 全局变量 ====================
-audio_recording_process = None  # FFmpeg音频录制进程
-is_audio_recording = False      # 是否正在录制音频
+audio_recording_processes = {}  # FFmpeg音频录制进程
     
 
 def get_mq_connection():
     credentials = pika.PlainCredentials(Config.RABBITMQ_USER, Config.RABBITMQ_PASS)
     return pika.BlockingConnection(
-        pika.ConnectionParameters(host=Config.RABBITMQ_HOST, port=Config.RABBITMQ_PORT, credentials=credentials)
+        pika.ConnectionParameters(
+            host=Config.RABBITMQ_HOST, 
+            port=Config.RABBITMQ_PORT, 
+            credentials=credentials
+        )
     )
 
 def publish_audio_ready(room_id, audio_path):
@@ -64,6 +67,11 @@ def get_room_directory(room_id):
         os.makedirs(room_dir)
     return room_dir
 
+def is_room_recording(room_id):
+    """check whether room is recording"""
+    process = audio_recording_processes.get(room_id)
+    return process is not None and process.pull() is None
+
 def start_audio_recording(room_id, rtsp_url):
     """
     开始从RTSP流提取音频到WAV文件
@@ -71,7 +79,9 @@ def start_audio_recording(room_id, rtsp_url):
     :param rtsp_url: RTSP流地址
     :return: (录制是否成功启动, 录制文件路径)
     """
-    global audio_recording_process, is_audio_recording
+    if is_room_recording(room_id):
+        print(f"⚠️ 会议{room_id}音频录制已在进行中，忽略本次启动请求")
+        return False, ""
 
     # 获取录制文件存储路径
     room_dir = get_room_directory(room_id)
@@ -94,16 +104,16 @@ def start_audio_recording(room_id, rtsp_url):
 
     try:
         # 启动FFmpeg录制进程
-        audio_recording_process = subprocess.Popen(
+        process = subprocess.Popen(
             ffmpeg_cmd,
             stdout=subprocess.DEVNULL,     # 屏蔽FFmpeg输出
             stderr=subprocess.PIPE,        # 捕获错误信息
         )
-        is_audio_recording = True
-        print(f"🔊 WAV音频录制已开始：{recording_path}")
+        audio_recording_processes[room_id] = process
+        print(f"🔊会议{room_id} WAV音频录制已开始：{recording_path}")
         return True, recording_path
     except Exception as e:
-        print(f"❌ 启动WAV音频录制失败：{e}")
+        print(f"❌会议{room_id} 启动WAV音频录制失败：{e}")
         return False, ""
 
 def stop_audio_recording(room_id, recording_path):
@@ -113,31 +123,30 @@ def stop_audio_recording(room_id, recording_path):
     :param recording_path: 录制文件路径（可用get_audio_recording_path获取）
     :return: 停止是否成功
     """
-    global audio_recording_process, is_audio_recording
+    process = audio_recording_processes.get(room_id)
 
-    if not is_audio_recording or not audio_recording_process:
-        print("❌ 音频录制未启动，无需停止")
+    if not process:
+        print(f"❌会议{room_id} 音频录制未启动，无需停止")
         return False
 
     try:
         # 终止FFmpeg进程（安全停止录制）
-        audio_recording_process.terminate()
+        process.terminate()
         # 等待进程退出，确保文件写入完成
-        stderr_output, _ = audio_recording_process.communicate(timeout=10)
-        print(f"🔊 FFmpeg stderr: {stderr_output.decode() if stderr_output else 'No stderr'}")
+        stderr_output, _ = process.communicate(timeout=10)
+        print(f"🔊会议{room_id} FFmpeg stderr: {stderr_output.decode() if stderr_output else 'No stderr'}")
     except subprocess.TimeoutExpired:
         # 超时则强制杀死进程
-        audio_recording_process.kill()
-        print("⚠️ 音频录制进程超时，已强制终止")
+        process.kill()
+        print(f"⚠️会议{room_id} 音频录制进程超时，已强制终止")
     except Exception as e:
-        print(f"⚠️ 停止音频录制时出错：{e}")
+        print(f"⚠️会议{room_id} 停止音频录制时出错：{e}")
 
     # 重置状态
-    audio_recording_process = None
-    is_audio_recording = False
-    print("🔊 WAV音频录制已停止")
+    del audio_recording_processes[room_id]
+    print(f"🔊会议{room_id} WAV音频录制已停止")
 
-    # 文件确认写完后，发布消息通知ASR服务处理，替代原来的文件夹扫描发现机制
+    # 文件确认写完后，发布消息通知ASR服务处理
     publish_audio_ready(room_id, recording_path)
     return True
 

@@ -21,14 +21,15 @@ class Config:
     AUDIO_FOLDER = 'static/audio'
     TRANSCRIPT_FOLDER = 'static/transcripts'
     
-    # 百度ASR配置
-    BAIDU_APP_ID = "7528270"
-    BAIDU_API_KEY = "sacHUMQacicQRXx4qeUDqwKb"
-    BAIDU_SECRET_KEY = "sjpWq0MuJ8HsH3kg47hM0Nh0fls0QZu6"
-    
     # 音频处理配置
     CHUNK_DURATION = 10                      # 音频分片时长（秒）
     BASE_AUDIO_DIR = r"D:\project_all\rstp1\storage"   # 音频存储目录
+
+    # 并发处理转录配置
+    ASR_WORKER_COUNT = 10 # 并发处理10个会议室的转录
+
+    # Ollama并发配置
+    MINUTES_WORKER_COUNT = 4
 
     # RabbitMQ 配置 
     RABBITMQ_HOST = 'localhost'

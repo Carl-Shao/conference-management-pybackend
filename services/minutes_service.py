@@ -1,12 +1,66 @@
 import requests
 import json
 import os
+import time
+import pika
+import threading
 from config import Config
 
 # ==================== 配置 ====================
 OLLAMA_MODEL = "qwen2.5:7b"
 OLLAMA_API_URL = "http://localhost:11434/api/chat"
 MINUTES_FILE = "meeting_minutes.md"
+STATUS_FILE = "minutes_status.json"
+
+# ==================== 全局变量（worker线程管理）====================
+
+_worker_threads = []
+_stop_flag = threading.Event()
+
+def get_mq_connection():
+    """create connection to RabbitMQ"""
+    credentials = pika.PlainCredentials(Config.RABBITMQ_USER, Config.RABBITMQ_PASS)
+    return pika.BlockingConnection(
+        pika.ConnectionParameters(
+            host=Config.RABBITMQ_HOST,
+            prot=Config.RABBITMQ_PORT,
+            credentials=credentials
+        )
+    )
+
+# ==================== 状态管理 ====================
+
+def _status_path(room_dir):
+    return os.path.join(room_dir, STATUS_FILE)
+ 
+ 
+def _write_status(room_dir, status, extra=None):
+    data = {"status": status, "updatedAt": time.time()}
+    if extra:
+        data.update(extra)
+    try:
+        with open(_status_path(room_dir), "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False)
+    except Exception as e:
+        print(f"❌ 写入纪要生成状态失败：{e}")
+
+def get_minutes_status(room_id):
+    """
+    获取会议纪要生成状态
+    :return: {"status": "pending"/"processing"/"completed"/"failed"/"not_found"}
+    """
+    room_dir = os.path.join(Config.BASE_AUDIO_DIR, room_id)
+    status_path = _status_path(room_dir)
+ 
+    if not os.path.exists(status_path):
+        return {"status": "not_found"}
+ 
+    try:
+        with open(status_path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception as e:
+        print(f"❌ 读取纪要生成状态失败：{e}")
+        return {"status": "unknown"}
 
 # ==================== 核心函数 ====================
 
@@ -452,7 +506,7 @@ def generate_meeting_minutes(transcript, room_dir):
                 "temperature": 0.3,
                 "top_p": 0.8,
             },
-            timeout=60,
+            timeout=120,
         )
 
         if response.status_code == 200:
@@ -462,7 +516,7 @@ def generate_meeting_minutes(transcript, room_dir):
             minutes_path = os.path.join(room_dir, MINUTES_FILE)
             with open(minutes_path, "w", encoding="utf-8") as f:
                 f.write(minutes)
-            print(f"\n✅ 会议纪要已生成：{minutes_path}")
+            print(f"\n✅[线程 {threading.current_thread().name}] 会议纪要已生成：{minutes_path}")
             print("\n=== 会议纪要预览 ===")
             print(minutes)
             return minutes
@@ -508,3 +562,133 @@ def generate_minutes_from_transcript_file(room_id):
     
     # 生成会议纪要
     return generate_meeting_minutes(transcript, room_dir)
+
+# ==================== 异步任务提交 ====================
+
+def request_minutes_generation(room_id):
+    """
+    提交一个"生成会议纪要"的异步任务到MQ，立即返回，不等待Ollama处理完成
+    :param room_id: 会议ID
+    :return: 是否提交成功
+    """
+    room_dir = os.path.join(Config.BASE_AUDIO_DIR,room_id)
+    if not os.path.exists(room_dir):
+        print(f"❌ 会议{room_id}转录文件不存在，无法提交纪要生成任务")
+        return False
+    
+    try:
+        connection = get_mq_connection()
+        channel = connection.channel()
+        channel.exchange_declare(exchange="minutes_events", exchange_type="direct", durable=True)
+        channel.queue_declare(queue="minutes_generate", durable=True)
+        channel.queue_bind(queue="minutes_generate", exchange="minutes_events", routing_key="minutes.generate")
+
+        meassage = json.dumps({'room_id':room_id, 'timestamp':time.time()})
+        channel.basic_publish(
+            exchange="minutes_events",
+            routing_key="minutes.generate",
+            body=meassage,
+            properties=pika.BasicProperties(delivery_mode=2)
+        )
+        connection.close()
+
+        _write_status(room_dir, "pending")
+        print(f"📤 已提交会议纪要生成任务：会议{room_id}")
+        return True
+    except Exception as e:
+        print(f"❌ 提交纪要生成任务失败：{e}")
+        return False
+
+
+# ==================== Worker线程（并发处理多个会议室的纪要生成）====================
+
+def _minutes_worker_entrypoint(worker_index):
+    """
+    单个worker线程的完整生命周期：独立连接RabbitMQ，prefetch=1串行消费"自己领到的"任务。
+
+    Ollama运行自己的服务进程，不加载进Python进程的内存，
+    只发HTTP请求、等待响应（I/O等待），
+    多个线程可以真正并发发请求、并发等待响应，不需要额外的进程级隔离。
+
+    并发上限取决于Ollama自身的并发配置（OLLAMA_NUM_PARALLEL）
+    """
+    connection = get_mq_connection()
+    channel = connection.channel()
+
+    channel.exchange_declare(exchange="minutes_events", exchange_type="direct", durable=True)
+    channel.queue_declare(queue="minutes_generate", durable=True)
+    channel.queue_bind(queue="minutes_generate", exchange="minutes_events", routing_key="minutes.generate")
+
+    channel.basic_qos(prefetch_count=1)
+
+    def callback(ch, method, properties,body):
+        try:
+            data = json.loads(body)
+            room_id = data['room_id']
+            room_dir = os.path.join(Config.BASE_AUDIO_DIR, room_id)
+
+            print(f"📩 [minutes-worker-{worker_index}] 收到纪要生成任务：会议{room_id}")
+            _write_status(room_dir, "processing")
+
+            minutes = generate_minutes_from_transcript_file(room_id)
+
+            if minutes:
+                _write_status(room_dir, "completed")
+                print(f"✅ [minutes-worker-{worker_index}] 会议{room_id}纪要生成完成")
+            else:
+                _write_status(room_dir, "failed")
+                print(f"❌ [minutes-worker-{worker_index}] 会议{room_id}纪要生成失败")
+
+            ch.basic_ack(delivery_tag=method.delivery_tag)
+        except Exception as e:
+            print(f"❌ [minutes-worker-{worker_index}] 处理纪要生成任务异常：{e}")
+            ch.basic_nack(delivery_tag=method.delivery_tag, requeue=False)
+
+    channel.basic_consume(queue='minutes_generate', on_message_callback=callback)
+    print(f"🔍 [minutes-worker-{worker_index}] 已就绪，开始监听纪要生成队列")    
+
+    #定期检查_stop_flag
+    try:
+        while _stop_flag.is_set():
+            connection.process_data_events(time_limit=1)
+    finally:
+        try:
+            channel.stop_consuming()
+            connection.close()
+        except Exception:
+            pass
+
+    
+def start_minutes_service(worker_count=None):
+    """
+    启动会议纪要生成服务：拉起N个worker线程并发消费MQ任务
+    :param worker_count: worker线程数，默认读取 Config.MINUTES_WORKER_COUNT
+    """
+    global _worker_threads
+    _stop_flag.clear()
+
+    worker_count = worker_count or getattr(Config, "MINUTES_WORKER_COUNT", 4)
+    print(f"🚀 启动会议纪要生成服务，worker数量：{worker_count}...")
+
+    for i in range(worker_count):
+        t = threading.Thread(
+            target=_minutes_worker_entrypoint,
+            args=(i,),
+            daemon=True,
+            name=f"minutes-worker-{i}"
+        )
+        t.start()
+        _worker_threads.append(t)
+        print(f"✅ minutes worker-{i} 已启动")
+
+    return _worker_threads
+
+
+def stop_minutes_service():
+    """停止会议纪要生成服务的所有worker线程"""
+    global _worker_threads
+    _stop_flag.set()
+    for t in _worker_threads:
+        t.join(timeout=5)
+    _worker_threads = []
+    print("🛑 会议纪要生成服务已停止")
